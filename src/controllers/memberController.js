@@ -8,7 +8,9 @@ exports.registerMember = async (req, res) => {
   try {
     const { 
       name, mobile, parentName, parentPhone, aadhar, 
-      joiningDate, room, bed, deposit, monthlyFee 
+      joiningDate, room, bed, deposit, monthlyFee,
+      isMidJoin, midJoinAmount, securityDeposit: secDep, monthlyRent: mRent,
+      photoUri, aadharDoc, rentalDoc,
     } = req.body;
 
     // Optional: Update the room occupants count if Room exists
@@ -25,8 +27,13 @@ exports.registerMember = async (req, res) => {
       joiningDate,
       room,
       bed,
-      securityDeposit: deposit ? Number(deposit) : 0,
-      monthlyRent: monthlyFee ? Number(monthlyFee) : 0,
+      securityDeposit: secDep ? Number(secDep) : (deposit ? Number(deposit) : 0),
+      monthlyRent: mRent ? Number(mRent) : (monthlyFee ? Number(monthlyFee) : 0),
+      isMidJoin: isMidJoin === true || isMidJoin === 'true',
+      midJoinAmount: midJoinAmount ? Number(midJoinAmount) : 0,
+      photoUri: photoUri || null,
+      aadharDoc: aadharDoc || null,
+      rentalDoc: rentalDoc || null,
     });
 
     if (roomDoc) {
@@ -95,15 +102,54 @@ exports.getMembers = async (req, res) => {
 // @access  Private (Merchant only)
 exports.getMemberById = async (req, res) => {
   try {
-    const member = await Member.findOne({ _id: req.params.id, hostelOwner: req.user._id });
+    const member = await Member.findOne({ _id: req.params.id, hostelOwner: req.user._id }).lean();
 
     if (!member) {
       return res.status(404).json({ success: false, message: 'Member not found' });
     }
 
+    // Check fees for current month
+    const Fee = require('../models/Fee');
+    const now = new Date();
+    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const paidFee = await Fee.findOne({ 
+      hostelOwner: req.user._id, 
+      member: member._id,
+      paymentMonth: currentMonthStr,
+      status: 'Paid',
+      type: 'Monthly Fee'
+    }).lean();
+
+    const hasPaid = !!paidFee;
+    let computedBalance = hasPaid ? 0 : (member.monthlyRent || 0);
+    
+    // Check mid-join
+    if (!hasPaid && member.isMidJoin && member.midJoinAmount > 0 && member.joiningDate) {
+      let joinDateObj = null;
+      if (/^\d{2}\/\d{2}\/\d{4}$/.test(member.joiningDate)) {
+        const [d, mo, y] = member.joiningDate.split('/');
+        joinDateObj = new Date(Number(y), Number(mo) - 1, Number(d));
+      } else {
+        joinDateObj = new Date(member.joiningDate);
+      }
+      if (joinDateObj && !isNaN(joinDateObj.getTime())) {
+        const isJoiningMonth = joinDateObj.getFullYear() === now.getFullYear() && joinDateObj.getMonth() === now.getMonth();
+        if (isJoiningMonth) {
+          computedBalance = member.midJoinAmount;
+        }
+      }
+    }
+
+    const computedStatus = hasPaid ? 'Active' : 'Pending Fee';
+
     res.status(200).json({
       success: true,
-      data: member,
+      data: {
+        ...member,
+        hasPaidCurrentMonth: hasPaid,
+        computedBalance,
+        computedStatus,
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -182,7 +228,7 @@ exports.deleteMember = async (req, res) => {
 // @access  Private (Merchant only)
 exports.transferMember = async (req, res) => {
   try {
-    const { newRoomNumber } = req.body;
+    const { newRoomNumber, newBed } = req.body;
     
     if (!newRoomNumber) {
       return res.status(400).json({ success: false, message: 'New room number is required' });
@@ -194,35 +240,77 @@ exports.transferMember = async (req, res) => {
     }
 
     if (member.room === newRoomNumber) {
-      return res.status(400).json({ success: false, message: 'Member is already in this room' });
+      return res.status(400).json({ success: false, message: 'Member is already in Room ' + newRoomNumber });
     }
 
     // Load old room and new room
-    const oldRoomDoc = await Room.findOne({ roomNumber: member.room, hostelOwner: req.user._id });
+    const oldRoomNumber = member.room;
+    const oldRoomDoc = await Room.findOne({ roomNumber: oldRoomNumber, hostelOwner: req.user._id });
     const newRoomDoc = await Room.findOne({ roomNumber: newRoomNumber, hostelOwner: req.user._id });
 
     if (!newRoomDoc) {
       return res.status(404).json({ success: false, message: 'New room not found in the database' });
     }
 
-    // Decrement old room occupants
-    if (oldRoomDoc && oldRoomDoc.occupants > 0) {
-      oldRoomDoc.occupants -= 1;
+    // Check capacity of target room
+    const newRoomOccupants = await Member.find({
+      room: newRoomNumber,
+      hostelOwner: req.user._id,
+      _id: { $ne: member._id },
+      status: { $ne: 'Inactive' },
+    });
+
+    if (newRoomDoc.roomCapacity && newRoomOccupants.length >= newRoomDoc.roomCapacity) {
+      return res.status(400).json({
+        success: false,
+        message: `Room ${newRoomNumber} is already full (${newRoomOccupants.length}/${newRoomDoc.roomCapacity} beds occupied)`,
+      });
+    }
+
+    // Determine available bed in the new room
+    let assignedBed = newBed;
+    if (!assignedBed) {
+      const takenBeds = newRoomOccupants.map((m) => m.bed);
+      const capacity = newRoomDoc.roomCapacity || 4;
+      for (let i = 1; i <= capacity; i++) {
+        const candidate = `Bed ${i}`;
+        if (!takenBeds.includes(candidate)) {
+          assignedBed = candidate;
+          break;
+        }
+      }
+      if (!assignedBed) {
+        assignedBed = `Bed ${newRoomOccupants.length + 1}`;
+      }
+    }
+
+    // Update old room occupants count
+    if (oldRoomDoc) {
+      const oldRoomRemaining = await Member.countDocuments({
+        room: oldRoomNumber,
+        hostelOwner: req.user._id,
+        _id: { $ne: member._id },
+        status: { $ne: 'Inactive' },
+      });
+      oldRoomDoc.occupants = oldRoomRemaining;
       await oldRoomDoc.save();
     }
 
-    // Increment new room occupants
-    newRoomDoc.occupants = (newRoomDoc.occupants || 0) + 1;
+    // Update new room occupants count
+    newRoomDoc.occupants = newRoomOccupants.length + 1;
     await newRoomDoc.save();
 
     // Update Member details
     member.room = newRoomNumber;
-    member.monthlyRent = newRoomDoc.pricePerMonth;
+    member.bed = assignedBed;
+    if (newRoomDoc.pricePerMonth) {
+      member.monthlyRent = newRoomDoc.pricePerMonth;
+    }
     await member.save();
 
     res.status(200).json({
       success: true,
-      message: 'Member transferred successfully',
+      message: `Transferred to Room ${newRoomNumber} (${assignedBed}) successfully`,
       data: member,
     });
   } catch (error) {
@@ -312,4 +400,8 @@ exports.assignMember = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+
+
+
 

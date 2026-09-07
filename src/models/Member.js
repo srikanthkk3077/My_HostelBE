@@ -38,6 +38,27 @@ const memberSchema = new mongoose.Schema({
   monthlyRent: {
     type: Number,
   },
+  // Mid-month join: owner sets a prorated amount for the first partial month
+  isMidJoin: {
+    type: Boolean,
+    default: false,
+  },
+  midJoinAmount: {
+    type: Number,
+    default: 0,
+  },
+    photoUri: {
+    type: String,
+    default: null,
+  },
+  aadharDoc: {
+    type: String,
+    default: null,
+  },
+  rentalDoc: {
+    type: String,
+    default: null,
+  },
   status: {
     type: String,
     enum: ['Active', 'Inactive'],
@@ -48,3 +69,5 @@ const memberSchema = new mongoose.Schema({
 });
 
 module.exports = mongoose.model('Member', memberSchema);
+
+

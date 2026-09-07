@@ -23,6 +23,10 @@ const roomSchema = new mongoose.Schema(
       min: [1, 'Room capacity must be at least 1'],
       required: [true, 'Please specify room capacity'],
     },
+    occupants: {
+      type: Number,
+      default: 0,
+    },
     hostelOwner: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',

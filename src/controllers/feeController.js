@@ -16,6 +16,21 @@ exports.collectFee = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Member not found' });
     }
 
+    // Check if fee for this month is already paid
+    const existingFee = await Fee.findOne({
+      hostelOwner: req.user._id,
+      member: memberId,
+      paymentMonth,
+      status: 'Paid',
+      type: type || 'Monthly Fee'
+    });
+    if (existingFee) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Monthly fee for ' + paymentMonth + ' has already been paid for this member.' 
+      });
+    }
+
     const fee = new Fee({
       hostelOwner: req.user._id,
       member: memberId,
